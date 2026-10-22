@@ -659,14 +659,40 @@ def load_csv(file: IO | str) -> pd.DataFrame:
     return clean_ohlc(out)
 
 
-def fetch_yfinance(ticker: str = "GC=F", interval: str = "1h", period: str = "730d") -> pd.DataFrame:
+YF_MAX_DAYS = {"1m": 7, "5m": 59, "15m": 59, "30m": 59, "1h": 729, "1d": 5000}
+
+
+def fetch_yfinance(ticker: str = "GC=F", interval: str = "1h", period: str = "729d") -> pd.DataFrame:
+    """Download from Yahoo, clamping the period to what Yahoo allows and trying fallbacks."""
     import yfinance as yf
 
-    raw = yf.download(ticker, interval=interval, period=period, auto_adjust=False,
-                      progress=False, threads=False)
+    days = int("".join(ch for ch in str(period) if ch.isdigit()) or 0)
+    days = min(days or YF_MAX_DAYS.get(interval, 59), YF_MAX_DAYS.get(interval, 59))
+    end = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    start = end - pd.Timedelta(days=days)
+    errors = []
+    raw = None
+    for tk in dict.fromkeys([ticker, "GC=F", "XAUUSD=X", "GLD"]):
+        for attempt in range(2):
+            try:
+                raw = yf.download(tk, interval=interval, start=start.strftime("%Y-%m-%d"),
+                                  end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                                  auto_adjust=False, progress=False, threads=False)
+            except Exception as exc:  # network, rate limit, bad ticker
+                errors.append(f"{tk}: {type(exc).__name__}")
+                raw = None
+            if raw is not None and not raw.empty:
+                break
+        if raw is not None and not raw.empty:
+            if tk != ticker:
+                st.info(f"No data for {ticker}; used {tk} instead.")
+            break
     if raw is None or raw.empty:
-        raise DataError("Yahoo Finance returned no data. Intraday history is limited "
-                        "(1m: 7d, 5m/15m/30m: 60d, 1h: 730d).")
+        raise DataError(
+            "Yahoo Finance returned no data (often it rate-limits shared cloud servers; wait a few minutes "
+            "and retry, or pick a shorter period/larger interval). Limits: 1m = 7 days, 5m/15m/30m = 59 days, "
+            "1h = 729 days. Most reliable alternative: export candles from MT5 and use Upload CSV."
+            + (f" Details: {'; '.join(errors[:3])}" if errors else ""))
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
     raw = _normalise_columns(raw)
@@ -1277,7 +1303,9 @@ def load_dataset(source: str):
     if source == "Yahoo Finance (GC=F futures)":
         c1, c2 = st.columns(2)
         interval = c1.selectbox("Interval", ["1h", "30m", "15m", "5m", "1d"], index=0)
-        period = c2.selectbox("Period", ["730d", "365d", "180d", "60d", "30d"], index=0)
+        opts = {"1h": ["729d", "365d", "180d", "60d"], "30m": ["59d", "30d"], "15m": ["59d", "30d"],
+                "5m": ["59d", "30d"], "1d": ["1825d", "730d", "365d"]}[interval]
+        period = c2.selectbox("Period (max Yahoo allows for this interval)", opts, index=0)
         if st.button("Download"):
             with st.spinner("Downloading..."):
                 st.session_state["raw_df"] = fetch_yfinance("GC=F", interval, period)
